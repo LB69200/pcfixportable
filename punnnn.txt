@@ -1,0 +1,87 @@
+Implémentation GNSS dans le microcontrôleur
+Maintenant que le GNSS fonctionne en commandes AT directes et que le WiFi est déjà intégré dans le code du microcontrôleur, l'étape suivante est d'automatiser la session GNSS depuis le nRF54L15.
+
+La contrainte principale est connue depuis les tests manuels : le LTE et le GNSS ne peuvent pas fonctionner en même temps. Le microcontrôleur doit donc gérer lui-même la bascule CFUN=4 (LTE off → GNSS on) puis le retour CFUN=1 (LTE on → GNSS off) après chaque acquisition.
+
+Détection d'un fix valide
+La première fonction ajoutée est is_gnss_fix(), qui filtre les trames NMEA reçues sur l'UART pour ne retenir que celles contenant une position réelle.
+
+[SCREEN : src/main.c lignes 173 à 180]
+
+Le module envoie en continu des trames $GPRMC (ou $GNRMC). Elles contiennent un champ statut : V signifie que le récepteur n'a pas encore de fix, A signifie que la position est valide. La fonction cherche ce champ et retourne 1 uniquement si le statut est A.
+
+Conversion des coordonnées NMEA en degrés décimaux
+Les trames NMEA n'expriment pas les coordonnées en degrés décimaux. Elles utilisent le format DDMM.MMMM (degrés + minutes décimales), qu'il faut convertir. La formule est : degrés décimaux = DD + MM.MMMM / 60.
+
+Sur Zephyr, sans activation explicite de l'unité FPU dans le Kconfig, atof() et printf("%f") ne fonctionnent pas. La conversion a donc été implémentée en arithmétique entière 64 bits, en travaillant en nanodegrés (1 nanodegré = 10⁻⁹ degré, ce qui donne une précision théorique de ~0,1 mm).
+
+[SCREEN : src/main.c lignes 238 à 265]
+
+Le résultat est formaté avec 7 décimales via %d.%07d, ce qui donne par exemple 44.8655000,-0.0310010.
+
+Cycle de tracking GNSS
+La fonction gnss_tracking_cycle() gère l'ensemble de la session GNSS de manière autonome.
+
+[SCREEN : src/main.c lignes 379 à 457]
+
+Le principe : répéter 5 fois la séquence suivante :
+
+Passer en CFUN=4 (LTE off)
+Démarrer le GNSS (AT$GPSP=1 + AT$GNSSNMEA=1,1)
+Attendre 5 trames valides (statut A)
+Arrêter le GNSS (AT$GNSSNMEA=0,0 + AT$GPSP=0)
+Revenir en LTE et publier la position sur MQTT
+Le premier fix dispose de 2 minutes (GNSS_TIMEOUT_MS), les suivants de 1 minute (GNSS_REFIX_TIMEOUT_MS) car l'almanach satellite est déjà chargé en mémoire après le premier fix.
+
+Retour LTE après une session GNSS
+Le retour en LTE n'est pas immédiat. CFUN=4 désactive aussi le contexte PDP (la session de données réseau), il faut le réactiver avant toute tentative MQTT. La fonction gnss_restore_lte() gère cette séquence :
+
+[SCREEN : src/main.c lignes 336 à 377]
+
+Séquence appliquée à chaque retour :
+
+AT+CFUN=1 → retour radio LTE
+Attente ré-enregistrement réseau (AT+CEREG? en boucle)
+Vérification AT#SGACT? → si le contexte PDP est tombé, réactivation AT#SGACT=1,1
+Vérification AT#MQCFG? → si la configuration MQTT a été effacée par le CFUN=4, réinitialisation complète ; sinon, rien à faire
+AT+CFUN=5 → retour en mode veille eDRX piloté par DTR
+Initialisation MQTT/TLS — connexion HiveMQ
+HiveMQ Cloud impose une connexion TLS sur le port 8883. Le module ME310M1 intègre son propre stack SSL, mais la séquence d'initialisation doit respecter un ordre précis.
+
+[SCREEN : src/main.c lignes 513 à 554]
+
+La séquence (découverte par analyse de la documentation AT) :
+
+
+MQDISC=1  →  MQEN=1,0          ← déconnecter et désactiver toute session existante
+SSLEN=1,1  →  SSLCFG  →  SSLSECCFG  →  SSLSECCFG2   ← configurer SSL pendant qu'il est actif
+SSLEN=1,0                        ← désactiver SSL AVANT MQCFG (requis par le module)
+MQEN=1,1                         ← activer MQTT proprement
+MQCFG=1,"broker",8883,...        ← lier broker + SSL (SSL doit être off à ce moment)
+SSLEN=1,1                        ← réactiver SSL pour utilisation réelle
+Si cette séquence n'est pas respectée (notamment le SSLEN=1,0 avant MQCFG), le module répond connection failed à la commande MQCFG.
+
+Pour la connexion et publication, le firmware se connecte (AT#MQCONN), publie, puis se déconnecte (AT#MQDISC) à chaque cycle. Une connexion permanente ne peut pas être maintenue pendant les phases de veille eDRX.
+
+[SCREEN : src/main.c lignes 567 à 618]
+
+Résultats GNSS sur HiveMQ
+[SCREEN : capture HiveMQ topic tracker/gnss avec une ou plusieurs positions reçues]
+
+Chaque message publié sur tracker/gnss contient la position au format lat,lon avec 7 décimales, par exemple :
+
+
+44.8655032,-0.0310148
+Le flag retain=1 est activé sur les deux topics (tracker/wifi et tracker/gnss), ce qui permet de toujours consulter la dernière position connue sur HiveMQ même en se connectant après la publication.
+
+Code final — boucle principale complète
+[SCREEN : src/main.c lignes 705 à 726]
+
+La boucle principale enchaîne désormais :
+
+Scan WiFi — 3 passages, capture SSID / RSSI / canal / MAC
+Tracking GNSS — 5 × (5 trames valides → publication tracker/gnss)
+Publication WiFi — résultats du scan sur tracker/wifi
+Veille 5 minutes — DTR LOW, module en basse consommation
+Réveil — DTR HIGH, re-initialisation WiFi, recommencer
+Le WiFi et le GNSS fonctionnent dans le même firmware mais jamais simultanément : le WiFi s'exécute en CFUN=5 (DTR HIGH, module actif, LTE on), le GNSS impose un passage en CFUN=4 (LTE off) pour chaque acquisition.
